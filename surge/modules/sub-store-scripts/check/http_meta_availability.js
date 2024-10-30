@@ -1,3 +1,9 @@
+/**
+ * 节点测活(适配 Sub-Store Node.js 版)
+ *
+ * HTTP META 参数以及其它参数说明详见上方注释
+ */
+
 async function operator(proxies = [], targetPlatform, env) {
   const cacheEnabled = $arguments.cache;
   const cache = scriptResourceCache;
@@ -16,6 +22,8 @@ async function operator(proxies = [], targetPlatform, env) {
   const keepIncompatible = $arguments.keep_incompatible;
   const validStatus = parseInt($arguments.status || 200);
   const url = decodeURIComponent($arguments.url || 'http://www.apple.com/library/test/success.html');
+  const latencyThreshold = 1000; // 延迟超过 1000 毫秒时丢弃
+  const timeout = parseFloat($arguments.timeout || 5000); // 请求超时，单位为毫秒
 
   const $ = $substore;
   const validProxies = [];
@@ -35,10 +43,8 @@ async function operator(proxies = [], targetPlatform, env) {
           }
         }
         internalProxies.push({ ...node, _proxies_index: index });
-      } else {
-        if (keepIncompatible) {
-          incompatibleProxies.push(proxy);
-        }
+      } else if (keepIncompatible) {
+        incompatibleProxies.push(proxy);
       }
     } catch (e) {
       $.error(e);
@@ -49,10 +55,9 @@ async function operator(proxies = [], targetPlatform, env) {
   if (!internalProxies.length) return proxies;
 
   const http_meta_timeout = http_meta_start_delay + internalProxies.length * http_meta_proxy_timeout;
+
   let http_meta_pid;
   let http_meta_ports = [];
-  
-  // 启动 HTTP META
   const res = await http({
     retries: 0,
     method: 'post',
@@ -66,6 +71,7 @@ async function operator(proxies = [], targetPlatform, env) {
       timeout: http_meta_timeout,
     }),
   });
+
   let body = res.body;
   try {
     body = JSON.parse(body);
@@ -76,21 +82,17 @@ async function operator(proxies = [], targetPlatform, env) {
   }
   http_meta_pid = pid;
   http_meta_ports = ports;
-  $.info(
-    `\n======== HTTP META 启动 ====\n[端口] ${ports}\n[PID] ${pid}\n[超时] 若未手动关闭 ${
-      Math.round(http_meta_timeout / 60 / 10) / 100
-    } 分钟后自动关闭\n`
-  );
+
   $.info(`等待 ${http_meta_start_delay / 1000} 秒后开始检测`);
   await $.wait(http_meta_start_delay);
 
   const concurrency = parseInt($arguments.concurrency || 10);
+
   await executeAsyncTasks(
     internalProxies.map(proxy => () => check(proxy)),
     { concurrency }
   );
 
-  // stop http meta
   try {
     const res = await http({
       method: 'post',
@@ -137,7 +139,7 @@ async function operator(proxies = [], targetPlatform, env) {
       const cached = cache.get(id);
       if (cacheEnabled && cached) {
         $.info(`[${proxy.name}] 使用缓存`);
-        if (cached.latency) {
+        if (cached.latency && cached.latency <= latencyThreshold) {
           validProxies.push({
             ...proxy,
             name: `${$arguments.show_latency ? `[${cached.latency}] ` : ''}${proxy.name}`,
@@ -148,29 +150,20 @@ async function operator(proxies = [], targetPlatform, env) {
 
       const index = internalProxies.indexOf(proxy);
       const startedAt = Date.now();
-
-      // 发起请求
       const res = await http({
         proxy: `http://${http_meta_host}:${http_meta_ports[index]}`,
         method,
+        timeout,
         headers: {
-          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
+          'User-Agent': 'Mozilla/5.0 ... Safari/604.1',
         },
         url,
       });
-
-      const latency = Date.now() - startedAt;
       const status = parseInt(res.status || res.statusCode || 200);
+      const latency = Date.now() - startedAt;
+      $.info(`[${proxy.name}] status: ${status}, latency: ${latency}`);
 
-      // 判断延迟是否高于1000毫秒
-      if (latency > 1000) {
-        $.info(`[${proxy.name}] 延迟 ${latency}ms 超过1000ms，被丢弃`);
-        failedProxies.push(proxy);
-        return;
-      }
-
-      // 判断响应状态
-      if (status === validStatus) {
+      if (status == validStatus && latency <= latencyThreshold) {
         validProxies.push({
           ...proxy,
           name: `${$arguments.show_latency ? `[${latency}] ` : ''}${proxy.name}`,
@@ -199,15 +192,14 @@ async function operator(proxies = [], targetPlatform, env) {
     const RETRIES = parseFloat(opt.retries ?? $arguments.retries ?? 1);
     const RETRY_DELAY = parseFloat(opt.retry_delay ?? $arguments.retry_delay ?? 1000);
     let count = 0;
-
+    
     const fn = async () => {
       try {
         return await $.http[METHOD]({ ...opt, timeout: TIMEOUT });
       } catch (e) {
         if (count < RETRIES) {
           count++;
-          const delay = RETRY_DELAY * count;
-          await $.wait(delay);
+          await $.wait(RETRY_DELAY * count);
           return await fn();
         } else {
           throw e;
@@ -222,7 +214,6 @@ async function operator(proxies = [], targetPlatform, env) {
       try {
         let running = 0;
         const results = [];
-
         let index = 0;
 
         function executeNextTask() {
@@ -247,10 +238,14 @@ async function operator(proxies = [], targetPlatform, env) {
                 executeNextTask();
               });
           }
-
           if (running === 0) {
             return resolve(result ? results : undefined);
           }
         }
-
-        await
+        executeNextTask();
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+}
