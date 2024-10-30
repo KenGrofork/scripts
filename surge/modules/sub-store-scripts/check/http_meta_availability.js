@@ -238,8 +238,8 @@ async function operator(proxies = [], targetPlatform, env) {
                 executeNextTask();
               });
           }
-          if (running === 0) {
-            return resolve(result ? results : undefined);
+          if (index >= tasks.length && running === 0) {
+            resolve(result ? results : undefined);
           }
         }
         executeNextTask();
